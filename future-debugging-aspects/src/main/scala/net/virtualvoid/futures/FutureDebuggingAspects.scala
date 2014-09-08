@@ -10,7 +10,7 @@ import org.aspectj.lang.reflect.SourceLocation
 import scala.concurrent.duration.Duration
 import scala.concurrent._
 import scala.reflect.ClassTag
-import scala.util.Try
+import scala.util.{ Success, Failure, Try }
 import scala.util.control.NonFatal
 
 case class RichFutureException(flow: CallTree, exceptionPoint: CallInfo, original: Throwable) extends RuntimeException(original) {
@@ -23,12 +23,13 @@ case class RichFutureException(flow: CallTree, exceptionPoint: CallInfo, origina
     copy(flow = change(flow))
 
   override def getMessage: String = {
-    def line(info: CallInfo): String = f"${info.indentedName}%-15s (called at ${info.location.getFileName}%s:${info.location.getLine}%d)"
+    def locationInfo(info: CallInfo): String = info.location.map(loc ⇒ s"${loc.getFileName}:${loc.getLine}").getOrElse("<unknown position>")
+    def line(info: CallInfo): String = f"${info.indentedName}%-15s @ ${locationInfo(info)}"
     def marker(mark: Boolean): String = if (mark) " -> " else "    "
     def treeToString(tree: CallTree, indent: String = ""): String = tree match {
       case Empty                          ⇒ ""
       case Single(info, parent)           ⇒ s"${treeToString(parent, indent)}${marker(info == exceptionPoint)}$indent${line(info)}\n"
-      case Merge(info, parent, subParent) ⇒ s"${treeToString(parent, indent)}${marker(info == exceptionPoint)}$indent${line(info)}\n${treeToString(subParent, indent + "  ")}"
+      case Merge(info, parent, subParent) ⇒ s"${treeToString(parent, indent)}${marker(info == exceptionPoint)}$indent${line(info)}\n${treeToString(subParent, indent + "    ")}"
     }
 
     "An exception was thrown during Future processing:\n" + treeToString(flow)
@@ -49,12 +50,12 @@ case object Empty extends CallTree
 case class Single(info: CallInfo, parent: CallTree) extends CallTree
 case class Merge(info: CallInfo, parent: CallTree, subParent: CallTree) extends CallTree
 
-case class CallInfo(name: String, location: SourceLocation) {
-  def toStackTraceElement: StackTraceElement =
-    new StackTraceElement("Future", name, location.getFileName, location.getLine)
-
+case class CallInfo(name: String, location: Option[SourceLocation]) {
   /** indents the name if it starts with a dot */
   def indentedName: String = if (name.startsWith(".")) "  " + name else name
+}
+object CallInfo {
+  def apply(name: String, location: SourceLocation): CallInfo = CallInfo(name, Some(location))
 }
 case class TracingFutureImpl[T](underlying: Future[T], tree: CallTree) extends Future[T] {
   def onComplete[U](f: (Try[T]) ⇒ U)(implicit executor: ExecutionContext): Unit = underlying.onComplete(f)(executor)
@@ -81,35 +82,42 @@ case class TracingFutureImpl[T](underlying: Future[T], tree: CallTree) extends F
       Single(newInfo, tree))
   }
   def flatMap[U](f: T ⇒ Future[U], newInfo: CallInfo)(implicit executor: ExecutionContext): Future[U] = {
-    val flatMapped = underlying.flatMap { t ⇒
-      val res = try f(t)
-      catch {
-        case NonFatal(ex) ⇒ throw RichFutureException(tree, newInfo, ex)
-      }
-      val tracing =
-        res match {
-          case t: TracingFutureImpl[U] ⇒ t
-          case fut                     ⇒ TracingFutureImpl(fut, Empty)
-        }
+    val flatMapped =
+      underlying
+        .transform(identity,
+          {
+            case r: RichFutureException ⇒ r.appendFuture(old ⇒ Single(newInfo, old))
+            case ex                     ⇒ ex
+          })
+        .flatMap { t ⇒
+          val res = try f(t)
+          catch {
+            case NonFatal(ex) ⇒ throw RichFutureException(Single(newInfo, tree), newInfo, ex)
+          }
+          val tracing =
+            res match {
+              case t: TracingFutureImpl[U] ⇒ t
+              case fut                     ⇒ TracingFutureImpl(fut, Empty)
+            }
 
-      tracing.transform(
-        identity,
-        {
-          case r: RichFutureException ⇒ r.appendFuture(old ⇒ Merge(newInfo, tree, old))
-          case ex                     ⇒ ex
-        })
-    }.transform(identity,
-      {
-        case r: RichFutureException ⇒ r.appendFuture(old ⇒ Single(newInfo, old))
-        case ex                     ⇒ ex
-      })
+          tracing.transform(
+            identity,
+            {
+              case r: RichFutureException ⇒ r.appendFuture(old ⇒ Merge(newInfo, tree, old))
+              case ex                     ⇒ ex
+            })
+        }
 
     TracingFutureImpl(flatMapped, Single(newInfo, tree))
   }
 }
 
 case class TracingPromiseImpl[T](underlying: Promise[T], creationInfo: CallInfo) extends Promise[T] {
-  def future: Future[T] = TracingFutureImpl(underlying.future, Single(creationInfo, Empty))
+  import scala.concurrent.ExecutionContext.Implicits.global
+  def future: Future[T] =
+    TracingFutureImpl(underlying.future /*.transform(identity, {
+      case NonFatal(ex) ⇒ throw RichFutureException(Single(creationInfo, Empty), creationInfo, ex)
+    })*/ , Single(CallInfo(".complete", None), Single(creationInfo, Empty)))
   def tryComplete(result: Try[T]): Boolean = underlying.tryComplete(result)
   def isCompleted: Boolean = underlying.isCompleted
 }
@@ -118,7 +126,6 @@ case class TracingPromiseImpl[T](underlying: Promise[T], creationInfo: CallInfo)
 class FutureDebuggingAspects {
   @Around("call(* scala.concurrent.Future$.apply(..)) && args(body, executor) && !within(net.virtualvoid.futures.*) ")
   def instrumentFutureApply[T](thisJoinPoint: ProceedingJoinPoint, body: Function0[T], executor: ExecutionContext): AnyRef = {
-    println(s"Future.apply called at ${thisJoinPoint.getSourceLocation} with executor $executor")
     val info = CallInfo("Future(...)", thisJoinPoint.getSourceLocation)
 
     val res = thisJoinPoint.proceed(Array(() ⇒ {
@@ -132,8 +139,6 @@ class FutureDebuggingAspects {
 
   @Around("call(* scala.concurrent.Future.map(..)) && args(f, executor) && target(self) && !this(net.virtualvoid.futures.TracingFutureImpl)")
   def instrumentFutureMap[T, U](thisJoinPoint: ProceedingJoinPoint, f: T ⇒ U, executor: ExecutionContext, self: Future[T]): AnyRef = {
-
-    //Thread.dumpStack()
     val info = CallInfo(".map", thisJoinPoint.getSourceLocation)
 
     val tracing =
@@ -150,7 +155,6 @@ class FutureDebuggingAspects {
 
   @Around("call(* scala.concurrent.Future.flatMap(..)) && args(f, executor) && target(self) && !this(net.virtualvoid.futures.TracingFutureImpl)")
   def instrumentFutureFlatMap[T, U](thisJoinPoint: ProceedingJoinPoint, f: T ⇒ Future[U], executor: ExecutionContext, self: Future[T]): AnyRef = {
-    println(s"Future.flatMap called at ${thisJoinPoint.getSourceLocation}")
     val info = CallInfo(s".flatMap", thisJoinPoint.getSourceLocation)
     val tracing =
       self match {
@@ -230,5 +234,22 @@ class FutureDebuggingAspects {
 
     val res = thisJoinPoint.proceed().asInstanceOf[Promise[T]]
     TracingPromiseImpl(res, info)
+  }
+  @Around("call(* scala.concurrent.Promise.complete(..)) && target(promise) && args(res) && !within(net.virtualvoid.futures.*) ")
+  def instrumentPromiseComplete[T](thisJoinPoint: ProceedingJoinPoint, promise: Promise[T], res: Try[T]): AnyRef = {
+    val info = CallInfo(".complete", thisJoinPoint.getSourceLocation)
+
+    val originalTree = promise match {
+      case TracingPromiseImpl(underlying, info) ⇒ Single(info, Empty)
+      case _                                    ⇒ Empty
+    }
+
+    val newResult =
+      res match {
+        case Failure(rich: RichFutureException) ⇒ Failure(rich.appendFuture(Single(info, _)))
+        case Failure(ex)                        ⇒ Failure(new RichFutureException(Single(info, originalTree), info, ex))
+        case s: Success[T]                      ⇒ s
+      }
+    promise.complete(newResult)
   }
 }

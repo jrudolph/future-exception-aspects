@@ -80,16 +80,13 @@ object ManualPromisesTest extends App {
 
 object FlatMapTest extends App {
   import scala.concurrent.ExecutionContext.Implicits.global
-  val f: Future[Int] = Future(13)
+  val f: Future[Int] = Future(42)
   val g: Future[Int] = Future(12)
 
   val fut =
     f.flatMap { fv ⇒
-      ???
-      g.map { gv ⇒
-        fv + gv
-      }
-    }.map(toStringOrThrow)
+      throw new RuntimeException
+    }
 
   fut.onComplete {
     case Success(res) ⇒ println(s"The result was $res")
